@@ -8,6 +8,7 @@
 #include <err.h>
 #include <assert.h>
 
+#include <string.h>
 #include <mpi.h>
 
 typedef uint64_t u64;       /* portable 64-bit integer */
@@ -304,34 +305,310 @@ int golden_claw_search2(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
     // --- PHASE 1 : REMPLISSAGE (FILL) ---
     // On parcourt NOS x, on calcule f(x), mais on ne stocke pas encore
     // car le stockage dépendra du hash (étape suivante)
+
+    // `send_buffers` est un tableau de tableaux. 
+    // send_buffers[i] contiendra la liste des données à envoyer au processus 'i'.
+    entry_data **send_buffers = malloc(nprocs * sizeof(entry_data*));
+
+    // `send_counts` retient combien d'éléments on a déjà mis dans chaque buffer.
+    int *send_counts = calloc(nprocs, sizeof(int));
+
+    // `send_capacities` retient la taille mémoire actuelle de chaque buffer.
+    int *send_capacities = malloc(nprocs * sizeof(int));
+
+    // Estimation de la taille : Si le hash est uniforme, chaque processus recevra environ 1/nprocs des données.
+    // On prend une marge de sécurité de 20% (* 1.2) pour éviter de faire trop de reallocs au début.
+    // On ajoute +128 pour être sûr d'avoir un minimum si my_count est petit.
+    int estimated_size = (my_count / nprocs) * 1.2 + 128;
+
+    for(int i = 0; i < nprocs; i++) {
+        send_capacities[i] = estimated_size;
+        // On alloue la mémoire pour les données
+        send_buffers[i] = malloc(send_capacities[i] * sizeof(entry_data));
+        
+        if (send_buffers[i] == NULL) {
+            fprintf(stderr, "[Rank %d] Erreur malloc buffer %d\n", rank, i);
+            MPI_Abort(comm, 1);
+        }
+    }
+
+
+
     for (u64 x = start_idx; x < end_idx; x++) {
         u64 z = f(x);
         
+        u64 hash = murmur64(z);
+        int target = hash % nprocs; // Le numéro du processus destinataire
+        
+        // Vérification de la place dans le buffer
+        if (send_counts[target] >= send_capacities[target]) {
+            // Le bac est plein ! On l'agrandit (x2).
+            send_capacities[target] *= 2;
+            entry_data *temp = realloc(send_buffers[target], send_capacities[target] * sizeof(entry_data));
+            
+            if (temp == NULL) {
+                fprintf(stderr, "[Rank %d] Erreur realloc buffer %d\n", rank, target);
+                MPI_Abort(comm, 1);
+            }
+            send_buffers[target] = temp;
+        }
+
+        // On stocke la donnée dans le buffer
+        // Note : On stocke {z, x} car z est la clé de recherche (hash) et x la valeur retrouvée.
+        send_buffers[target][send_counts[target]].data_val = z;   // La clé f(x)
+        send_buffers[target][send_counts[target]].candidate = x;  // La valeur x
+        
+        send_counts[target]++; // On incrémente le compteur
         // TODO (Etape 2): 
         // 1. Calculer target = murmur64(z) % nprocs
         // 2. Stocker (z, x) dans un buffer d'envoi pour 'target'
     }
 
+    double mid_time = wtime();
+    // Petit print de debug (seulement le rank 0 pour pas spammer)
+    if (rank == 0) printf("Fill preparation done in %.2fs. Ready to exchange.\n", mid_time - start_time);
+
     // TODO (Etape 3): Échanger les buffers (MPI_Alltoall) et insérer dans le dict local
 
+    // 3.1 Échanger les tailles (Combien vais-je recevoir de chacun ?)
+    int *recv_counts = malloc(nprocs * sizeof(int));
+
+    // Tout le monde envoie son tableau 'send_counts' à tout le monde.
+    // À la fin, recv_counts[i] contiendra le nombre d'éléments que le processus 'i' va m'envoyer.
+    MPI_Alltoall(send_counts, 1, MPI_INT, recv_counts, 1, MPI_INT, comm);
+
+    // 3.2 Préparer les déplacements (displacements) pour MPI_Alltoallv
+    // MPI a besoin de savoir où commence les données de chaque processus dans le buffer contigu.
+    int *send_displs = malloc(nprocs * sizeof(int));
+    int *recv_displs = malloc(nprocs * sizeof(int));
+
+    u64 total_send = 0;
+    u64 total_recv = 0;
+    
+    // Calcul des offsets (déplacements)
+    send_displs[0] = 0;
+    recv_displs[0] = 0;
+    total_send = send_counts[0];
+    total_recv = recv_counts[0];
+    
+    for (int i = 1; i < nprocs; i++) {
+        send_displs[i] = send_displs[i-1] + send_counts[i-1];
+        recv_displs[i] = recv_displs[i-1] + recv_counts[i-1];
+        
+        total_send += send_counts[i];
+        total_recv += recv_counts[i];
+    }
+
+    // 3.3 Aplatir les buffers d'envoi (Flattening)
+    // MPI_Alltoallv veut un seul gros tableau contigu pour l'envoi.
+    // Nous devons copier nos petits buffers dispersés (send_buffers[i]) dans un gros (flat_send_buf).
+    
+    entry_data *flat_send_buf = malloc(total_send * sizeof(entry_data));
+    
+    for (int i = 0; i < nprocs; i++) {
+        // Copie mémoire rapide
+        // Dest : &flat_send_buf[offset]
+        // Source : send_buffers[i]
+        // Taille : send_counts[i] * sizeof(entry_data)
+        if (send_counts[i] > 0) {
+             // memcpy est plus rapide qu'une boucle for
+             memcpy(&flat_send_buf[send_displs[i]], send_buffers[i], send_counts[i] * sizeof(entry_data));
+        }
+        // On peut libérer les petits buffers individuels maintenant pour gagner de la RAM
+        free(send_buffers[i]); 
+    }
+    free(send_buffers); // Libération du tableau de pointeurs
+
+    // 3.4 Allouer le buffer de réception
+    entry_data *recv_buf = malloc(total_recv * sizeof(entry_data));
+    if (recv_buf == NULL && total_recv > 0) {
+         err(1, "Malloc recv_buf failed");
+    }
+
+    // 3.5 Conversion en BYTES pour l'envoi
+    // MPI gère mal les types custom si on ne crée pas un MPI_Datatype.
+    // Astuce classique : on triche en disant qu'on envoie des MPI_BYTE (octets).
+    // Il faut donc multiplier tous les counts et displs par sizeof(entry_data).
+    
+    int *s_cnts_b = malloc(nprocs * sizeof(int));
+    int *r_cnts_b = malloc(nprocs * sizeof(int));
+    int *s_displs_b = malloc(nprocs * sizeof(int));
+    int *r_displs_b = malloc(nprocs * sizeof(int));
+
+    for(int i=0; i<nprocs; i++) {
+        s_cnts_b[i] = send_counts[i] * sizeof(entry_data);
+        r_cnts_b[i] = recv_counts[i] * sizeof(entry_data);
+        s_displs_b[i] = send_displs[i] * sizeof(entry_data);
+        r_displs_b[i] = recv_displs[i] * sizeof(entry_data);
+    }
+
+    // 3.6 L'échange MPI (enfin !)
+    MPI_Alltoallv(flat_send_buf, s_cnts_b, s_displs_b, MPI_BYTE,
+                  recv_buf,      r_cnts_b, r_displs_b, MPI_BYTE,
+                  comm);
+
+    // 3.7 Insertion dans le Dictionnaire Local
+    // Maintenant, 'recv_buf' contient toutes les données dont JE suis responsable.
+    
+    for (u64 i = 0; i < total_recv; i++) {
+        // recv_buf[i].data_val  c'est le hash z (la CLÉ)
+        // recv_buf[i].candidate c'est la valeur x
+        dict_insert(recv_buf[i].data_val, recv_buf[i].candidate);
+    }
+    
+    // 3.8 Nettoyage mémoire de cette phase
+    free(flat_send_buf);
+    free(recv_buf);
+    free(send_counts); free(recv_counts);
+    free(send_displs); free(recv_displs);
+    free(send_capacities);
+    // On garde les buffers _b pour la phase suivante ou on les free et realloc ? 
+    // Mieux vaut tout free pour être propre, on réallouera pour la phase Probe.
+    free(s_cnts_b); free(r_cnts_b); free(s_displs_b); free(r_displs_b);
+
     MPI_Barrier(comm); // Attendre que tout le monde ait fini de remplir
-    double mid_time = wtime();
+    mid_time = wtime();
     if (rank == 0) printf("Fill phase logic done in %.1fs\n", mid_time - start_time);
 
 
     // --- PHASE 2 : SONDAGE (PROBE) ---
-    // On parcourt NOS y (on peut réutiliser les mêmes bornes car l'espace est le même)
-    for (u64 y_val = start_idx; y_val < end_idx; y_val++) {
-        u64 z_prime = g(y_val);
-
-        // TODO (Etape 4):
-        // 1. Calculer target = murmur64(z_prime) % nprocs
-        // 2. Stocker (z_prime, y_val) dans un buffer d'envoi pour 'target'
-    }
+    // Réallocation des structures pour la phase 2 (on repart à zéro)
     
-    // TODO (Etape 5): Échanger et vérifier dans le dict local
+    send_buffers = malloc(nprocs * sizeof(entry_data*));
+    send_counts = calloc(nprocs, sizeof(int));
+    send_capacities = malloc(nprocs * sizeof(int));
+    
+    // On réutilise la même estimation de taille
+    estimated_size = (my_count / nprocs) * 1.2 + 128;
 
-    return 0; // Placeholder
+    for(int i = 0; i < nprocs; i++) {
+        send_capacities[i] = estimated_size;
+        send_buffers[i] = malloc(send_capacities[i] * sizeof(entry_data));
+        if (send_buffers[i] == NULL) MPI_Abort(comm, 1);
+    }
+
+    // --- 4. Remplissage des buffers avec g(y) ---
+    // On parcourt NOS y (les mêmes indices que pour x)
+    for (u64 y_val = start_idx; y_val < end_idx; y_val++) {
+        u64 z_prime = g(y_val); 
+
+        // Règle d'or : On utilise EXACTEMENT le même hachage que pour f(x)
+        // Si f(x) == g(y), alors murmur64(f(x)) == murmur64(g(y))
+        // Donc ils iront vers le même 'target'.
+        u64 hash = murmur64(z_prime);
+        int target = hash % nprocs;
+
+        // Gestion capacité (identique phase 1)
+        if (send_counts[target] >= send_capacities[target]) {
+            send_capacities[target] *= 2;
+            entry_data *temp = realloc(send_buffers[target], send_capacities[target] * sizeof(entry_data));
+            if (temp == NULL) MPI_Abort(comm, 1);
+            send_buffers[target] = temp;
+        }
+
+        // On stocke la requête
+        // data_val = z_prime (la valeur qu'on cherche dans le dico)
+        // candidate = y_val (la valeur k2 potentielle)
+        send_buffers[target][send_counts[target]].data_val = z_prime;
+        send_buffers[target][send_counts[target]].candidate = y_val;
+        send_counts[target]++;
+    }
+
+    // --- 5. Échange MPI et Vérification (Probe) ---
+
+    // 5.1 Échange des tailles
+    // On doit réallouer recv_counts car on l'avait free
+    recv_counts = malloc(nprocs * sizeof(int));
+    MPI_Alltoall(send_counts, 1, MPI_INT, recv_counts, 1, MPI_INT, comm);
+
+    // 5.2 Recalcul des offsets
+    send_displs = malloc(nprocs * sizeof(int));
+    recv_displs = malloc(nprocs * sizeof(int));
+    
+    send_displs[0] = 0; recv_displs[0] = 0;
+    total_send = send_counts[0];
+    total_recv = recv_counts[0];
+
+    for (int i = 1; i < nprocs; i++) {
+        send_displs[i] = send_displs[i-1] + send_counts[i-1];
+        recv_displs[i] = recv_displs[i-1] + recv_counts[i-1];
+        total_send += send_counts[i];
+        total_recv += recv_counts[i];
+    }
+
+    // 5.3 Aplatir (Flatten)
+    flat_send_buf = malloc(total_send * sizeof(entry_data));
+    for (int i = 0; i < nprocs; i++) {
+        if (send_counts[i] > 0) {
+             memcpy(&flat_send_buf[send_displs[i]], send_buffers[i], send_counts[i] * sizeof(entry_data));
+        }
+        free(send_buffers[i]); 
+    }
+    free(send_buffers);
+
+    // 5.4 Buffer de réception
+    recv_buf = malloc(total_recv * sizeof(entry_data));
+    
+    // 5.5 Conversion Bytes
+    s_cnts_b = malloc(nprocs * sizeof(int));
+    r_cnts_b = malloc(nprocs * sizeof(int));
+    s_displs_b = malloc(nprocs * sizeof(int));
+    r_displs_b = malloc(nprocs * sizeof(int));
+
+    for(int i=0; i<nprocs; i++) {
+        s_cnts_b[i] = send_counts[i] * sizeof(entry_data);
+        r_cnts_b[i] = recv_counts[i] * sizeof(entry_data);
+        s_displs_b[i] = send_displs[i] * sizeof(entry_data);
+        r_displs_b[i] = recv_displs[i] * sizeof(entry_data);
+    }
+
+    // 5.6 L'échange (Probe Data)
+    MPI_Alltoallv(flat_send_buf, s_cnts_b, s_displs_b, MPI_BYTE,
+                  recv_buf,      r_cnts_b, r_displs_b, MPI_BYTE,
+                  comm);
+
+    // 5.7 Vérification Locale (Le cœur de l'attaque)
+    
+    int nres = 0;       // Solutions trouvées localement
+    u64 x_candidates[256]; // Buffer pour récupérer les collisions
+    
+    for (u64 i = 0; i < total_recv; i++) {
+        u64 val_to_find = recv_buf[i].data_val;  // g(y)
+        u64 candidate_y = recv_buf[i].candidate; // y
+
+        // On regarde dans NOTRE dictionnaire local si on a ce hash
+        int nx = dict_probe(val_to_find, 256, x_candidates);
+        
+        // dict_probe remplit x_candidates avec les x tels que f(x) == val_to_find
+        for (int k = 0; k < nx; k++) {
+            // On a une collision hash ! 
+            // x_candidates[k] vient du dico (donc c'est un k1 potentiel)
+            // candidate_y vient du réseau (donc c'est un k2 potentiel)
+            
+            if (is_good_pair(x_candidates[k], candidate_y)) {
+                if (nres < maxres) {
+                    k1[nres] = x_candidates[k];
+                    k2[nres] = candidate_y;
+                    nres++;
+                    printf("[Rank %d] FOUND SOLUTION: k1=%lx, k2=%lx\n", rank, x_candidates[k], candidate_y);
+                }
+            }
+        }
+    }
+
+    // --- Nettoyage Final ---
+    free(flat_send_buf); free(recv_buf);
+    free(send_counts); free(recv_counts);
+    free(send_displs); free(recv_displs);
+    free(send_capacities);
+    free(s_cnts_b); free(r_cnts_b); free(s_displs_b); free(r_displs_b);
+
+    // Note: Chaque processus retourne SON nombre de solutions trouvées.
+    // Le main ne verra que les solutions du rank qui a trouvé (via les printf).
+    // Pour être 100% propre, il faudrait faire un MPI_Gather des solutions vers le rank 0,
+    // mais pour ce projet, le printf suffit généralement.
+    
+    return nres;
 }
 
 /************************** command-line options ****************************/
@@ -390,40 +667,52 @@ void process_command_line_options(int argc, char ** argv)
 
 int main(int argc, char **argv)
 {
-
+    // Initialisation MPI
     MPI_Init(&argc, &argv);
-
+    
     int rank, nprocs;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
 
+    process_command_line_options(argc, argv);
 
-	process_command_line_options(argc, argv);
-
-    if(rank == 0){
+    // Seul le rank 0 affiche les infos de démarrage
+    if (rank == 0) {
         printf("Running with n=%d, C0=(%08x, %08x) and C1=(%08x, %08x)\n", 
             (int) n, C[0][0], C[0][1], C[1][0], C[1][1]);
     }
 
+    // Allocation distribuée
+    dict_setup_mpi(1.125 * (1ull << n), rank, nprocs);
 
-	dict_setup(1.125 * (1ull << n), rank , nprocs);
+    /* search */
+    u64 k1[16], k2[16];
+    
+    // Appel de la recherche
+    int nkey = golden_claw_search2(16, k1, k2, MPI_COMM_WORLD);
+    
+    // --- CORRECTION ICI ---
+    // On enlève assert(nkey > 0) car tous les processus ne trouvent pas forcément une solution.
+    
+    // On peut faire une barrière pour que l'affichage reste propre (optionnel)
+    MPI_Barrier(MPI_COMM_WORLD);
 
-	/* search */
-	u64 k1[16], k2[16];
+    /* validation */
+    // La boucle ne s'exécute QUE si nkey > 0 (donc seulement sur le processus gagnant)
+    for (int i = 0; i < nkey; i++) {
+        // Double vérification locale
+        assert(f(k1[i]) == g(k2[i]));
+        assert(is_good_pair(k1[i], k2[i]));     
+        
+        // On affiche fièrement le résultat
+        printf("#################################################################\n");
+        printf("[Rank %d] FINAL VALIDATED SOLUTION: (%" PRIx64 ", %" PRIx64 ")\n", rank, k1[i], k2[i]);
+        printf("#################################################################\n");
+    }
 
-	int nkey = golden_claw_search(16, k1, k2, MPI_COMM_WORLD);
-	assert(nkey > 0);
-
+    // Nettoyage final
     free(A);
     MPI_Finalize();
-
-
-	/* validation */
-	for (int i = 0; i < nkey; i++) {
-    	assert(f(k1[i]) == g(k2[i]));
-    	assert(is_good_pair(k1[i], k2[i]));		
-	    printf("Solution found: (%" PRIx64 ", %" PRIx64 ") [checked OK]\n", k1[i], k2[i]);
-	}
-
+    
     return 0;
 }
