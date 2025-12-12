@@ -8,11 +8,18 @@
 #include <err.h>
 #include <assert.h>
 
+#include <mpi.h>
+
 typedef uint64_t u64;       /* portable 64-bit integer */
 typedef uint32_t u32;       /* portable 32-bit integer */
 struct __attribute__ ((packed)) entry { u32 k; u64 v; };  /* hash table entry */
 
 /***************************** global variables ******************************/
+
+typedef struct {
+    u64 data_val;  // La valeur hashée (f(x) ou g(y)) -> servira de CLÉ
+    u64 candidate; // La pré-image (x ou y) -> servira de VALEUR
+} entry_data;
 
 u64 n = 0;         /* block size (in bits) */
 u64 mask;          /* this is 2**n - 1 */
@@ -127,6 +134,32 @@ void dict_setup(u64 size)
 		err(1, "impossible to allocate the dictionnary");
 	for (u64 i = 0; i < dict_size; i++)
 		A[i].k = EMPTY;
+}
+
+/* allocate a hash table logic for MPI */
+void dict_setup_mpi(u64 global_size, int rank, int nprocs)
+{
+    // Chaque nœud prend sa part du gâteau
+    u64 local_size = global_size / nprocs;
+    
+    // On ajoute un peu de marge pour gérer les arrondis et éviter les collisions
+    dict_size = local_size; 
+
+    char hdsize[8];
+    human_format(dict_size * sizeof(*A), hdsize);
+    
+    // Seul le rang 0 affiche l'info pour ne pas spammer la console
+    if (rank == 0) {
+        printf("Total Dictionary size distributed over %d procs.\n", nprocs);
+        printf("Local Dictionary size: %sB per node\n", hdsize);
+    }
+
+    A = malloc(sizeof(*A) * dict_size);
+    if (A == NULL)
+        err(1, "impossible to allocate the dictionnary");
+        
+    for (u64 i = 0; i < dict_size; i++)
+        A[i].k = EMPTY;
 }
 
 /* Insert the binding key |----> value in the dictionnary */
@@ -248,6 +281,59 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[])
     return nres;
 }
 
+
+
+int golden_claw_search2(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
+{
+    double start_time = wtime();
+    u64 N = 1ull << n;
+
+    int rank, nprocs;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &nprocs);
+
+    // 1. Découpage de l'espace de recherche (Work Partitioning)
+    u64 range = N / nprocs;
+    u64 remainder = N % nprocs;
+    
+    // Calcul précis pour gérer le reste si N n'est pas divisible par nprocs
+    u64 start_idx = rank * range + (rank < remainder ? rank : remainder);
+    u64 my_count = range + (rank < remainder ? 1 : 0);
+    u64 end_idx = start_idx + my_count;
+
+    // --- PHASE 1 : REMPLISSAGE (FILL) ---
+    // On parcourt NOS x, on calcule f(x), mais on ne stocke pas encore
+    // car le stockage dépendra du hash (étape suivante)
+    for (u64 x = start_idx; x < end_idx; x++) {
+        u64 z = f(x);
+        
+        // TODO (Etape 2): 
+        // 1. Calculer target = murmur64(z) % nprocs
+        // 2. Stocker (z, x) dans un buffer d'envoi pour 'target'
+    }
+
+    // TODO (Etape 3): Échanger les buffers (MPI_Alltoall) et insérer dans le dict local
+
+    MPI_Barrier(comm); // Attendre que tout le monde ait fini de remplir
+    double mid_time = wtime();
+    if (rank == 0) printf("Fill phase logic done in %.1fs\n", mid_time - start_time);
+
+
+    // --- PHASE 2 : SONDAGE (PROBE) ---
+    // On parcourt NOS y (on peut réutiliser les mêmes bornes car l'espace est le même)
+    for (u64 y_val = start_idx; y_val < end_idx; y_val++) {
+        u64 z_prime = g(y_val);
+
+        // TODO (Etape 4):
+        // 1. Calculer target = murmur64(z_prime) % nprocs
+        // 2. Stocker (z_prime, y_val) dans un buffer d'envoi pour 'target'
+    }
+    
+    // TODO (Etape 5): Échanger et vérifier dans le dict local
+
+    return 0; // Placeholder
+}
+
 /************************** command-line options ****************************/
 
 void usage(char **argv)
@@ -304,16 +390,33 @@ void process_command_line_options(int argc, char ** argv)
 
 int main(int argc, char **argv)
 {
-	process_command_line_options(argc, argv);
-    printf("Running with n=%d, C0=(%08x, %08x) and C1=(%08x, %08x)\n", 
-        (int) n, C[0][0], C[0][1], C[1][0], C[1][1]);
 
-	dict_setup(1.125 * (1ull << n));
+    MPI_Init(&argc, &argv);
+
+    int rank, nprocs;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+
+
+	process_command_line_options(argc, argv);
+
+    if(rank == 0){
+        printf("Running with n=%d, C0=(%08x, %08x) and C1=(%08x, %08x)\n", 
+            (int) n, C[0][0], C[0][1], C[1][0], C[1][1]);
+    }
+
+
+	dict_setup(1.125 * (1ull << n), rank , nprocs);
 
 	/* search */
 	u64 k1[16], k2[16];
-	int nkey = golden_claw_search(16, k1, k2);
+
+	int nkey = golden_claw_search(16, k1, k2, MPI_COMM_WORLD);
 	assert(nkey > 0);
+
+    free(A);
+    MPI_Finalize();
+
 
 	/* validation */
 	for (int i = 0; i < nkey; i++) {
@@ -321,4 +424,6 @@ int main(int argc, char **argv)
     	assert(is_good_pair(k1[i], k2[i]));		
 	    printf("Solution found: (%" PRIx64 ", %" PRIx64 ") [checked OK]\n", k1[i], k2[i]);
 	}
+
+    return 0;
 }
