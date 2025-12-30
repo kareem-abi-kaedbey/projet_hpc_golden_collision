@@ -261,7 +261,7 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
     u64 global_start_idx = rank * range + (rank < remainder ? rank : remainder);
     u64 my_total_count = range + (rank < remainder ? 1 : 0);
     
-    int NUM_CHUNKS = 256; 
+    int NUM_CHUNKS = 512; 
     u64 chunk_size = my_total_count / NUM_CHUNKS;
 
     //PHASE 1 : REMPLISSAGE (FILL)
@@ -273,12 +273,16 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
         u64 c_end = c_start + c_count;
 
         thread_buffer_t **thread_buffers = malloc(max_threads * sizeof(thread_buffer_t*));
+        if(thread_buffers == NULL)
+            err(1, "malloc failed");
         
         #pragma omp parallel
         {
             int tid = omp_get_thread_num();
             int n_threads = omp_get_num_threads();
             thread_buffers[tid] = malloc(nprocs * sizeof(thread_buffer_t));
+            if(thread_buffers[tid] == NULL)
+                err(1, "malloc failed");
             
             int est_size = (c_count / nprocs / n_threads) * 1.5 + 128;
 
@@ -286,6 +290,8 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
                 thread_buffers[tid][i].capacity = est_size;
                 thread_buffers[tid][i].count = 0;
                 thread_buffers[tid][i].buffer = malloc(est_size * sizeof(entry_data));
+                if(thread_buffers[tid][i].buffer == NULL)
+                    err(1, "malloc failed");
             }
 
             #pragma omp for schedule(static)
@@ -297,7 +303,10 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
                 thread_buffer_t *tb = &thread_buffers[tid][target];
                 if (tb->count >= tb->capacity) {
                     tb->capacity *= 2;
-                    tb->buffer = realloc(tb->buffer, tb->capacity * sizeof(entry_data));
+                    entry_data *tmp = realloc(tb->buffer, tb->capacity * sizeof(entry_data));
+                    if(tmp==NULL)
+                        err(1, "realloc thread buffer phase 1 error");
+                    tb->buffer = tmp;
                 }
                 tb->buffer[tb->count].data_val = z;
                 tb->buffer[tb->count].candidate = x;
@@ -307,6 +316,8 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
 
         // Fusion Chunk
         int *send_counts = calloc(nprocs, sizeof(int));
+        if(send_counts == NULL)
+            err(1, "calloc failed");
         for (int t = 0; t < max_threads; t++) {
             for (int p = 0; p < nprocs; p++) {
                 send_counts[p] += thread_buffers[t][p].count;
@@ -317,6 +328,8 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
         }
 
         int *send_displs = malloc(nprocs * sizeof(int));
+        if(send_displs == NULL)
+            err(1, "malloc failed");
         u64 total_send = 0;
         send_displs[0] = 0;
         total_send += send_counts[0];
@@ -326,7 +339,11 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
         }
 
         entry_data *flat_send_buf = malloc(total_send * sizeof(entry_data));
+        if(flat_send_buf == NULL)
+            err(1, "malloc failed");
         int *current_offsets = calloc(nprocs, sizeof(int));
+        if(current_offsets == NULL)
+            err(1, "calloc failed");
         
         for (int t = 0; t < max_threads; t++) {
             for (int p = 0; p < nprocs; p++) {
@@ -345,9 +362,13 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
 
         // Échange MPI Chunk
         int *recv_counts = malloc(nprocs * sizeof(int));
+        if(recv_counts == NULL)
+            err(1,"malloc failed");
         MPI_Alltoall(send_counts, 1, MPI_INT, recv_counts, 1, MPI_INT, comm);
 
         int *recv_displs = malloc(nprocs * sizeof(int));
+        if(recv_displs == NULL)
+            err(1, "malloc failed");
         u64 total_recv = 0;
         recv_displs[0] = 0;
         total_recv = recv_counts[0];
@@ -357,6 +378,8 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
         }
 
         entry_data *recv_buf = malloc(total_recv * sizeof(entry_data));
+        if(recv_buf == NULL)
+            err(1,"malloc failed");
         MPI_Alltoallv(flat_send_buf, send_counts, send_displs, dt_entry,
                       recv_buf,      recv_counts, recv_displs, dt_entry, comm);
 
@@ -391,18 +414,24 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
         u64 c_end = c_start + c_count;
 
         thread_buffer_t **thread_buffers = malloc(max_threads * sizeof(thread_buffer_t*));
+        if(thread_buffers == NULL)
+            err(1, "malloc failed");
         
         #pragma omp parallel
         {
             int tid = omp_get_thread_num();
             int n_threads = omp_get_num_threads();
             thread_buffers[tid] = malloc(nprocs * sizeof(thread_buffer_t));
+            if(thread_buffers[tid] == NULL)
+                err(1, "malloc failed");
             int est_size = (c_count / nprocs / n_threads) * 1.5 + 128;
 
             for (int i = 0; i < nprocs; i++) {
                 thread_buffers[tid][i].capacity = est_size;
                 thread_buffers[tid][i].count = 0;
                 thread_buffers[tid][i].buffer = malloc(est_size * sizeof(entry_data));
+                if(thread_buffers[tid][i].buffer == NULL)
+                    err(1, "malloc failed");
             }
 
             #pragma omp for schedule(static)
@@ -414,7 +443,10 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
                 thread_buffer_t *tb = &thread_buffers[tid][target];
                 if (tb->count >= tb->capacity) {
                     tb->capacity *= 2;
-                    tb->buffer = realloc(tb->buffer, tb->capacity * sizeof(entry_data));
+                    entry_data *tmp = realloc(tb->buffer, tb->capacity * sizeof(entry_data));
+                    if(tmp==NULL)
+                        err(1, "realloc thread buffer phase 2 error");
+                    tb->buffer = tmp;
                 }
                 tb->buffer[tb->count].data_val = z_prime;
                 tb->buffer[tb->count].candidate = y_val;
@@ -424,6 +456,8 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
 
         // Fusion Chunk Phase 2
         int *send_counts = calloc(nprocs, sizeof(int));
+        if(send_counts == NULL)
+            err(1, "calloc failed");
         for (int t = 0; t < max_threads; t++) {
             for (int p = 0; p < nprocs; p++) {
                 send_counts[p] += thread_buffers[t][p].count;
@@ -435,6 +469,8 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
         }
 
         int *send_displs = malloc(nprocs * sizeof(int));
+        if(send_displs == NULL)
+            err(1, "malloc failed");
         u64 total_send = 0;
         send_displs[0] = 0;
         total_send += send_counts[0];
@@ -444,7 +480,11 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
         }
 
         entry_data *flat_send_buf = malloc(total_send * sizeof(entry_data));
+        if(flat_send_buf == NULL)
+            err(1, "malloc failed");
         int *current_offsets = calloc(nprocs, sizeof(int));
+        if(current_offsets == NULL)
+            err(1, "calloc failed");
         
         for (int t = 0; t < max_threads; t++) {
             for (int p = 0; p < nprocs; p++) {
@@ -463,9 +503,13 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
 
         // Échange MPI Chunk Phase 2
         int *recv_counts = malloc(nprocs * sizeof(int));
+        if(recv_counts == NULL)
+            err(1, "malloc failed");
         MPI_Alltoall(send_counts, 1, MPI_INT, recv_counts, 1, MPI_INT, comm);
 
         int *recv_displs = malloc(nprocs * sizeof(int));
+        if(recv_displs == NULL)
+            err(1, "malloc failed");
         u64 total_recv = 0;
         recv_displs[0] = 0;
         total_recv = recv_counts[0];
@@ -475,6 +519,8 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[], MPI_Comm comm)
         }
 
         entry_data *recv_buf = malloc(total_recv * sizeof(entry_data));
+        if(recv_buf == NULL)
+            err(1, "malloc failed");
         MPI_Alltoallv(flat_send_buf, send_counts, send_displs, dt_entry,
                       recv_buf,      recv_counts, recv_displs, dt_entry, comm);
 
